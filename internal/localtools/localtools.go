@@ -1,10 +1,15 @@
 // Package localtools — набор локальных инструментов для примеров.
-// Данные выдуманные: важно не содержание, а то, как инструмент вызывается.
+//
+// Локальный инструмент реализован и выполняется внутри самой программы:
+// харнесс вызывает его без MCP-сервера и без сети. Данные о погоде
+// выдуманные: важно не содержание, а то, как инструмент вызывается.
 package localtools
 
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,7 +22,11 @@ var weather = map[string]string{
 	"санкт-петербург": "+6 °C, туман, ветер 3 м/с",
 }
 
-// New возвращает локальные инструменты get_weather и get_current_time.
+// NotesPath — файл, в который save_note записывает заметки.
+const NotesPath = "data/notes.txt"
+
+// New возвращает локальные инструменты get_weather, get_current_time
+// и save_note (опасный: меняет данные пользователя).
 func New() *tools.LocalToolbox {
 	box := tools.NewLocalToolbox()
 
@@ -45,6 +54,38 @@ func New() *tools.LocalToolbox {
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 	}, func(_ context.Context, _ map[string]any) (string, error) {
 		return time.Now().Format("02.01.2006 15:04"), nil
+	})
+
+	box.Register(tools.Tool{
+		Name:        "save_note",
+		Description: "Сохраняет заметку пользователя в файл заметок",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"text": map[string]any{"type": "string", "description": "Текст заметки"},
+			},
+			"required": []string{"text"},
+		},
+		// Инструмент меняет данные, поэтому харнесс спросит подтверждение.
+		Dangerous: true,
+	}, func(_ context.Context, args map[string]any) (string, error) {
+		text, _ := args["text"].(string)
+		if strings.TrimSpace(text) == "" {
+			return "", fmt.Errorf("пустая заметка")
+		}
+		if err := os.MkdirAll(filepath.Dir(NotesPath), 0o755); err != nil {
+			return "", err
+		}
+		file, err := os.OpenFile(NotesPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return "", err
+		}
+		defer file.Close()
+		line := time.Now().Format("02.01.2006 15:04") + " " + text + "\n"
+		if _, err := file.WriteString(line); err != nil {
+			return "", err
+		}
+		return "заметка сохранена в " + NotesPath, nil
 	})
 
 	return box

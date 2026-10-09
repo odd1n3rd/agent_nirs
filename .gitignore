@@ -1,3 +1,6 @@
 /bin/
 *.exe
 .env
+# Память и заметки создаются при запуске (память — из data/memory.example.json)
+/data/memory.json
+/data/notes.txt

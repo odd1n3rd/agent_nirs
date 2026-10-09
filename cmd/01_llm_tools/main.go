@@ -1,8 +1,10 @@
 // Вариант 1. LLM + инструменты, без харнесса.
 //
-// Модели передаются описания инструментов. Модель отвечает вызовом
-// инструмента: именем и параметрами. Но вызов инструмента — это только
-// предложение: сама LLM ничего не выполняет. Харнесса нет, поэтому:
+// Модели передаются системный промпт и описания инструментов — так же, как
+// в вариантах 3 и 4, чтобы отличие было только в отсутствии харнесса.
+// Модель отвечает вызовом инструмента: именем и параметрами. Но вызов
+// инструмента — это только предложение: сама LLM ничего не выполняет.
+// Харнесса нет, поэтому:
 //   - вызов никто не выполнит, результат инструмента не появится;
 //   - цикла агента нет: после одного ответа модели всё заканчивается;
 //   - нет истории и памяти: LLM stateless, второй вызов не знает о первом;
@@ -21,6 +23,7 @@ import (
 	"github.com/wannacry39/agent_nirs/internal/cli"
 	"github.com/wannacry39/agent_nirs/internal/llm"
 	"github.com/wannacry39/agent_nirs/internal/localtools"
+	"github.com/wannacry39/agent_nirs/internal/prompt"
 )
 
 func main() {
@@ -40,9 +43,11 @@ func main() {
 	}
 	printJSON("Список инструментов, переданный модели", specs)
 
+	system := llm.Message{Role: "system", Content: prompt.Build(true, false)}
+
 	// Единственный вызов модели.
 	fmt.Println("\nЗапрос:", request)
-	resp, err := model.Complete(ctx, []llm.Message{{Role: "user", Content: request}}, specs)
+	resp, err := model.Complete(ctx, []llm.Message{system, {Role: "user", Content: request}}, specs)
 	if err != nil {
 		cli.Fatal(err)
 	}
@@ -59,7 +64,7 @@ func main() {
 	// Второй вызов: LLM не хранит состояние между вызовами.
 	followUp := "А какой город я только что спрашивал?"
 	fmt.Println("\nВторой запрос (без истории, её некому хранить):", followUp)
-	resp, err = model.Complete(ctx, []llm.Message{{Role: "user", Content: followUp}}, specs)
+	resp, err = model.Complete(ctx, []llm.Message{system, {Role: "user", Content: followUp}}, specs)
 	if err != nil {
 		cli.Fatal(err)
 	}

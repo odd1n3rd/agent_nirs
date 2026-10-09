@@ -28,49 +28,54 @@ import (
 	"github.com/wannacry39/agent_nirs/internal/llm"
 	"github.com/wannacry39/agent_nirs/internal/localtools"
 	"github.com/wannacry39/agent_nirs/internal/mcp"
-	"github.com/wannacry39/agent_nirs/internal/memory"
 	"github.com/wannacry39/agent_nirs/internal/prompt"
-	"github.com/wannacry39/agent_nirs/internal/skills"
 	"github.com/wannacry39/agent_nirs/internal/tools"
 )
 
 func main() {
-	ctx := context.Background()
+	if err := run(context.Background()); err != nil {
+		cli.Fatal(err)
+	}
+}
 
+func run(ctx context.Context) error {
 	serverURL := os.Getenv("MCP_SERVER_URL")
 	if serverURL == "" {
 		serverURL = "http://127.0.0.1:8000/mcp"
 	}
 	mailServer := mcp.NewClient(serverURL)
 	if err := mailServer.Connect(ctx); err != nil {
-		cli.Fatal(fmt.Errorf("не удалось подключиться к MCP-серверу %s: %w (запущен ли go run ./cmd/mcp_mail_server?)", serverURL, err))
+		return fmt.Errorf("не удалось подключиться к MCP-серверу %s: %w (запущен ли go run ./cmd/mcp_mail_server?)", serverURL, err)
 	}
+	// Закрываем сессию на сервере при любом выходе из run.
 	defer mailServer.Close(ctx)
 	fmt.Fprintf(os.Stderr, "[MCP-клиент] подключён к %s, инструментов: %d\n", serverURL, len(mailServer.Tools()))
 
-	mem, err := memory.Open("data/memory.json")
+	mem, err := cli.OpenMemory()
 	if err != nil {
-		cli.Fatal(err)
+		return err
 	}
-	library, err := skills.Load("skills")
+	library, err := cli.LoadSkills()
 	if err != nil {
-		cli.Fatal(err)
+		return err
 	}
 
 	h, err := harness.New(harness.Config{
 		LLM:          llm.NewFromEnv(),
-		SystemPrompt: prompt.System,
+		SystemPrompt: prompt.Build(true, !library.Empty()),
 		Toolboxes: []tools.Toolbox{
 			localtools.New(), // локальные инструменты
 			mailServer,       // MCP-инструменты
 		},
-		Memory:  mem,
-		Skills:  library,
-		Confirm: cli.Confirm,
+		Memory:   mem,
+		Skills:   library,
+		ReadOnly: cli.ReadOnly(),
+		Confirm:  cli.Confirm,
 	})
 	if err != nil {
-		cli.Fatal(err)
+		return err
 	}
 
 	cli.Run(ctx, h, "Вариант 4: LLM + харнесс + локальные и MCP-инструменты", os.Args[1:])
+	return nil
 }

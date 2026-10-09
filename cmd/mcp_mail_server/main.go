@@ -5,8 +5,9 @@
 // delete_message. Сам выполняет их вызовы. Почта хранится в памяти процесса,
 // письма выдуманные.
 //
-// delete_message помечен аннотацией destructiveHint: харнесс увидит это
-// в tools/list и перед вызовом спросит подтверждение у пользователя.
+// Инструменты чтения помечены аннотацией readOnlyHint, delete_message —
+// destructiveHint. Харнесс увидит это в tools/list: инструменты без
+// readOnlyHint он считает опасными и перед вызовом спрашивает подтверждение.
 //
 // Запуск: go run ./cmd/mcp_mail_server   (адрес меняется переменной MCP_ADDR)
 package main
@@ -77,13 +78,14 @@ func main() {
 	}}
 
 	server := mcp.NewServer("mail-server", "1.0.0")
-	destructive := true
+	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: ptr(true)}
 
 	server.AddTool(mcp.ServerTool{
 		Info: mcp.ToolInfo{
 			Name:        "get_all_incoming_messages",
 			Description: "Возвращает все входящие письма: id, отправитель, тема, текст",
 			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+			Annotations: readOnly,
 		},
 		Handler: func(context.Context, map[string]any) (string, error) { return box.all(), nil },
 	})
@@ -99,6 +101,7 @@ func main() {
 				},
 				"required": []string{"query"},
 			},
+			Annotations: readOnly,
 		},
 		Handler: func(_ context.Context, args map[string]any) (string, error) {
 			query, _ := args["query"].(string)
@@ -117,7 +120,7 @@ func main() {
 				},
 				"required": []string{"message_id"},
 			},
-			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
+			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: ptr(false), DestructiveHint: ptr(true)},
 		},
 		Handler: func(_ context.Context, args map[string]any) (string, error) {
 			id := fmt.Sprint(args["message_id"])
@@ -136,6 +139,8 @@ func main() {
 	log.Printf("[MCP-сервер] почта слушает http://%s/mcp", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
+
+func ptr(v bool) *bool { return &v }
 
 func toJSON(v any) string {
 	raw, _ := json.MarshalIndent(v, "", "  ")

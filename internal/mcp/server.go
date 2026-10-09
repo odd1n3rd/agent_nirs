@@ -6,8 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"sync"
+	"time"
 )
 
 // ServerTool — инструмент MCP-сервера: описание и реализация.
@@ -16,8 +19,10 @@ type ServerTool struct {
 	Handler func(ctx context.Context, args map[string]any) (string, error)
 }
 
-// Server — MCP-сервер: предоставляет функции стороннего сервиса в виде
-// инструментов по MCP и сам выполняет их вызовы.
+// Server — MCP-сервер: сервер, который предоставляет функции стороннего
+// сервиса в виде инструментов по MCP и сам выполняет их вызовы. При
+// подключении сервер передаёт список этих инструментов, а получив вызов,
+// выполняет нужный инструмент и присылает ответ.
 //
 // Сервер принимает POST-запросы с JSON-RPC 2.0 и отвечает JSON.
 // Это подмножество транспорта Streamable HTTP из спецификации MCP:
@@ -27,12 +32,15 @@ type Server struct {
 
 	mu       sync.Mutex
 	tools    []ServerTool
-	sessions map[string]bool
+	sessions map[string]time.Time // сессия → время последнего обращения
 }
+
+// SessionTTL — через сколько без обращений сессия забывается.
+const SessionTTL = 30 * time.Minute
 
 // NewServer создаёт MCP-сервер.
 func NewServer(name, version string) *Server {
-	return &Server{name: name, version: version, sessions: map[string]bool{}}
+	return &Server{name: name, version: version, sessions: map[string]time.Time{}}
 }
 
 // AddTool регистрирует инструмент.
@@ -44,12 +52,29 @@ func (s *Server) AddTool(tool ServerTool) {
 
 // ServeHTTP обрабатывает одно сообщение JSON-RPC.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Спецификация требует проверять Origin: иначе страница в браузере
+	// может обратиться к локальному серверу (DNS rebinding).
+	if !allowedOrigin(r.Header.Get("Origin")) {
+		http.Error(w, "запрещённый Origin", http.StatusForbidden)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodPost:
 	case http.MethodDelete: // клиент закрывает сессию
+		id := r.Header.Get(headerSessionID)
+		if id == "" {
+			http.Error(w, "нет заголовка "+headerSessionID, http.StatusBadRequest)
+			return
+		}
+		if !s.touchSession(id) {
+			http.Error(w, "неизвестная сессия", http.StatusNotFound)
+			return
+		}
 		s.mu.Lock()
-		delete(s.sessions, r.Header.Get(headerSessionID))
+		delete(s.sessions, id)
 		s.mu.Unlock()
+		log.Printf("[MCP-сервер] сессия %s закрыта", id)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	default:
@@ -64,15 +89,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, Response{JSONRPC: "2.0", Error: &RPCError{codeParseError, "некорректный JSON"}})
 		return
 	}
-
-	// Уведомление (без ID): ответ не нужен.
-	if req.ID == nil {
-		w.WriteHeader(http.StatusAccepted)
+	if req.JSONRPC != "2.0" || req.Method == "" || string(req.ID) == "null" {
+		writeJSON(w, Response{JSONRPC: "2.0", ID: req.ID, Error: &RPCError{codeInvalidRequest, "некорректный запрос JSON-RPC 2.0"}})
 		return
 	}
 
-	if req.Method != "initialize" && !s.knownSession(r.Header.Get(headerSessionID)) {
-		http.Error(w, "неизвестная сессия, сначала вызовите initialize", http.StatusNotFound)
+	// Всё, кроме initialize, выполняется только в известной сессии.
+	if req.Method != "initialize" {
+		id := r.Header.Get(headerSessionID)
+		if id == "" {
+			http.Error(w, "нет заголовка "+headerSessionID+", сначала вызовите initialize", http.StatusBadRequest)
+			return
+		}
+		if !s.touchSession(id) {
+			http.Error(w, "неизвестная сессия, вызовите initialize заново", http.StatusNotFound)
+			return
+		}
+	}
+
+	// Уведомление (без ID): ответ не нужен.
+	if req.IsNotification() {
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
@@ -87,10 +124,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handle(ctx context.Context, w http.ResponseWriter, req Request) (any, *RPCError) {
 	switch req.Method {
 	case "initialize":
-		sessionID := newSessionID()
-		s.mu.Lock()
-		s.sessions[sessionID] = true
-		s.mu.Unlock()
+		sessionID := s.newSession()
 		w.Header().Set(headerSessionID, sessionID)
 		log.Printf("[MCP-сервер] новая сессия %s", sessionID)
 		return initializeResult{
@@ -103,6 +137,8 @@ func (s *Server) handle(ctx context.Context, w http.ResponseWriter, req Request)
 		return map[string]any{}, nil
 
 	case "tools/list":
+		// Инструментов мало, поэтому список отдаётся одной страницей
+		// (без nextCursor).
 		s.mu.Lock()
 		infos := make([]ToolInfo, 0, len(s.tools))
 		for _, tool := range s.tools {
@@ -145,16 +181,56 @@ func (s *Server) findTool(name string) (ServerTool, bool) {
 	return ServerTool{}, false
 }
 
-func (s *Server) knownSession(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sessions[id]
-}
-
-func newSessionID() string {
+// newSession создаёт сессию и заодно забывает истёкшие.
+func (s *Server) newSession() string {
 	buf := make([]byte, 16)
 	_, _ = rand.Read(buf)
-	return hex.EncodeToString(buf)
+	id := hex.EncodeToString(buf)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for old, seen := range s.sessions {
+		if now.Sub(seen) > SessionTTL {
+			delete(s.sessions, old)
+		}
+	}
+	s.sessions[id] = now
+	return id
+}
+
+// touchSession проверяет, что сессия известна и не истекла, и продлевает её.
+func (s *Server) touchSession(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen, ok := s.sessions[id]
+	if !ok {
+		return false
+	}
+	if time.Since(seen) > SessionTTL {
+		delete(s.sessions, id)
+		return false
+	}
+	s.sessions[id] = time.Now()
+	return true
+}
+
+// allowedOrigin разрешает запросы без Origin (обычные программы)
+// и со страниц на этой же машине.
+func allowedOrigin(origin string) bool {
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

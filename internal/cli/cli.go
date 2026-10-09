@@ -4,11 +4,22 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/wannacry39/agent_nirs/internal/harness"
+	"github.com/wannacry39/agent_nirs/internal/memory"
+	"github.com/wannacry39/agent_nirs/internal/skills"
+)
+
+// Пути относительно корня репозитория: программы запускаются из него.
+const (
+	MemoryPath        = "data/memory.json"
+	MemoryExamplePath = "data/memory.example.json"
+	SkillsDir         = "skills"
 )
 
 var stdin = bufio.NewReader(os.Stdin)
@@ -19,7 +30,47 @@ func Confirm(question string) bool {
 	fmt.Fprintf(os.Stderr, "\n%s [y/N]: ", question)
 	answer, _ := stdin.ReadString('\n')
 	answer = strings.ToLower(strings.TrimSpace(answer))
+	fmt.Fprintln(os.Stderr)
 	return answer == "y" || answer == "yes" || answer == "д" || answer == "да"
+}
+
+// ReadOnly — права пользователя «только чтение», если задана переменная
+// окружения AGENT_READ_ONLY=1.
+func ReadOnly() bool { return os.Getenv("AGENT_READ_ONLY") == "1" }
+
+// OpenMemory открывает память. При первом запуске файл памяти создаётся
+// из примера data/memory.example.json (сам файл памяти не хранится в git).
+func OpenMemory() (*memory.Memory, error) {
+	if _, err := os.Stat(MemoryPath); errors.Is(err, os.ErrNotExist) {
+		example, err := os.ReadFile(MemoryExamplePath)
+		switch {
+		case err == nil:
+			if err := os.MkdirAll(filepath.Dir(MemoryPath), 0o755); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(MemoryPath, example, 0o644); err != nil {
+				return nil, err
+			}
+			fmt.Fprintf(os.Stderr, "[харнесс] память создана из %s\n", MemoryExamplePath)
+		case errors.Is(err, os.ErrNotExist):
+			fmt.Fprintf(os.Stderr, "[харнесс] предупреждение: нет %s — запускайте из корня репозитория; память пустая\n", MemoryExamplePath)
+		default:
+			return nil, err
+		}
+	}
+	return memory.Open(MemoryPath)
+}
+
+// LoadSkills загружает skills и предупреждает, если их не нашлось.
+func LoadSkills() (*skills.Library, error) {
+	library, err := skills.Load(SkillsDir)
+	if err != nil {
+		return nil, err
+	}
+	if library.Empty() {
+		fmt.Fprintf(os.Stderr, "[харнесс] предупреждение: в папке %s нет skills — запускайте из корня репозитория\n", SkillsDir)
+	}
+	return library, nil
 }
 
 // Run — если запрос передан аргументами, выполняет его один раз,
