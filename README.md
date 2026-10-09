@@ -150,13 +150,31 @@
 
 ## Запуск
 
-Нужен Go 1.22+ и любой OpenAI-совместимый API. Команды выполняются из корня репозитория.
+Нужен Go 1.22+ и любой OpenAI-совместимый API, который поддерживает вызов
+инструментов (tools). Команды выполняются из корня репозитория.
+
+**Ollama (локально, бесплатно).** Установить с [ollama.com](https://ollama.com), затем:
 
 ```bash
-export LLM_BASE_URL=https://api.openai.com/v1   # или http://localhost:11434/v1 для Ollama
-export LLM_API_KEY=sk-...                        # для Ollama любая строка
-export LLM_MODEL=gpt-4o-mini                     # для Ollama, например, qwen2.5:7b
+ollama pull qwen2.5:7b            # ~4.7 ГБ, нужно ~8 ГБ памяти; на слабой машине — qwen2.5:3b
+export LLM_BASE_URL=http://localhost:11434/v1
+export LLM_API_KEY=ollama         # любая строка
+export LLM_MODEL=qwen2.5:7b
 ```
+
+**Yandex AI Studio:**
+
+```bash
+export LLM_BASE_URL=https://llm.api.cloud.yandex.net/v1
+export LLM_API_KEY=<API-ключ>
+export LLM_PROJECT=<ID каталога>
+export LLM_MODEL=gpt://<ID каталога>/yandexgpt/latest
+```
+
+**OpenAI:** `LLM_BASE_URL=https://api.openai.com/v1`, `LLM_API_KEY=sk-...`, `LLM_MODEL=gpt-4o-mini`.
+
+В Windows PowerShell переменные задаются так: `$env:LLM_MODEL="qwen2.5:7b"`.
+Пример всех переменных — в `.env.example`.
 
 ```bash
 # 1. LLM + инструменты: модель вернёт вызов, но выполнять его некому

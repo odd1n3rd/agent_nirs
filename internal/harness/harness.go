@@ -59,7 +59,7 @@ type Limits struct {
 }
 
 // DefaultLimits — лимиты по умолчанию.
-var DefaultLimits = Limits{MaxSteps: 10, MaxTokens: 50_000, MaxDuration: 2 * time.Minute}
+var DefaultLimits = Limits{MaxSteps: 10, MaxTokens: 50_000, MaxDuration: 5 * time.Minute}
 
 // ContextPolicy — правила управления контекстом (это не лимиты: при их
 // достижении работа не останавливается, а контекст сжимается).

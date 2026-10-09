@@ -82,17 +82,20 @@ type Client struct {
 	BaseURL string
 	APIKey  string
 	Model   string
+	Project string // заголовок OpenAI-Project (нужен, например, Yandex AI Studio)
 	HTTP    *http.Client
 }
 
 // NewFromEnv создаёт клиент по переменным окружения:
-// LLM_BASE_URL, LLM_API_KEY, LLM_MODEL.
+// LLM_BASE_URL, LLM_API_KEY, LLM_MODEL и необязательной LLM_PROJECT.
 func NewFromEnv() *Client {
 	return &Client{
 		BaseURL: envOr("LLM_BASE_URL", "https://api.openai.com/v1"),
 		APIKey:  os.Getenv("LLM_API_KEY"),
 		Model:   envOr("LLM_MODEL", "gpt-4o-mini"),
-		HTTP:    &http.Client{Timeout: 120 * time.Second},
+		Project: os.Getenv("LLM_PROJECT"),
+		// Локальная модель на процессоре может отвечать минутами.
+		HTTP: &http.Client{Timeout: 5 * time.Minute},
 	}
 }
 
@@ -131,6 +134,9 @@ func (c *Client) complete(ctx context.Context, messages []Message, tools []ToolS
 	req.Header.Set("Content-Type", "application/json")
 	if c.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+	if c.Project != "" {
+		req.Header.Set("OpenAI-Project", c.Project)
 	}
 
 	resp, err := c.HTTP.Do(req)
