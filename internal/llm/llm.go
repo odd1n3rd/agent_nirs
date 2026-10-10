@@ -31,6 +31,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -84,6 +85,11 @@ type Client struct {
 	Model   string
 	Project string // заголовок OpenAI-Project (нужен, например, Yandex AI Studio)
 	HTTP    *http.Client
+	// Retries — сколько раз повторить запрос, если провайдер ответил
+	// «слишком много запросов» (429) или временной ошибкой (5xx).
+	// Бесплатные тарифы часто так отвечают при нагрузке.
+	Retries int
+	Log     io.Writer // куда писать о повторах; nil — никуда
 }
 
 // NewFromEnv создаёт клиент по переменным окружения:
@@ -95,7 +101,9 @@ func NewFromEnv() *Client {
 		Model:   envOr("LLM_MODEL", "gpt-4o-mini"),
 		Project: os.Getenv("LLM_PROJECT"),
 		// Локальная модель на процессоре может отвечать минутами.
-		HTTP: &http.Client{Timeout: 5 * time.Minute},
+		HTTP:    &http.Client{Timeout: 5 * time.Minute},
+		Retries: 3,
+		Log:     os.Stderr,
 	}
 }
 
@@ -126,30 +134,9 @@ func (c *Client) complete(ctx context.Context, messages []Message, tools []ToolS
 		return Response{}, err
 	}
 
-	url := strings.TrimRight(c.BaseURL, "/") + "/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	raw, err := c.post(ctx, body)
 	if err != nil {
 		return Response{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	}
-	if c.Project != "" {
-		req.Header.Set("OpenAI-Project", c.Project)
-	}
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return Response{}, fmt.Errorf("запрос к LLM: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return Response{}, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return Response{}, fmt.Errorf("LLM вернула %d: %s", resp.StatusCode, raw)
 	}
 
 	var parsed struct {
@@ -160,9 +147,17 @@ func (c *Client) complete(ctx context.Context, messages []Message, tools []ToolS
 		Usage struct {
 			TotalTokens int `json:"total_tokens"`
 		} `json:"usage"`
+		// Некоторые провайдеры (например, OpenRouter) сообщают об ошибке
+		// модели внутри ответа с кодом 200.
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return Response{}, fmt.Errorf("разбор ответа LLM: %w", err)
+	}
+	if parsed.Error != nil {
+		return Response{}, fmt.Errorf("LLM вернула ошибку: %s", parsed.Error.Message)
 	}
 	if len(parsed.Choices) == 0 {
 		return Response{}, fmt.Errorf("LLM вернула пустой ответ: %s", raw)
@@ -175,6 +170,93 @@ func (c *Client) complete(ctx context.Context, messages []Message, tools []ToolS
 	}
 	choice := parsed.Choices[0]
 	return Response{Message: choice.Message, TotalTokens: tokens, FinishReason: choice.FinishReason}, nil
+}
+
+// post отправляет запрос и повторяет его при 429 и временных ошибках 5xx.
+// Пауза берётся из заголовка Retry-After, если провайдер его прислал,
+// иначе растёт: 2, 4, 8 секунд.
+func (c *Client) post(ctx context.Context, body []byte) ([]byte, error) {
+	url := strings.TrimRight(c.BaseURL, "/") + "/chat/completions"
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.APIKey)
+		}
+		if c.Project != "" {
+			req.Header.Set("OpenAI-Project", c.Project)
+		}
+		if strings.Contains(c.BaseURL, "openrouter.ai") {
+			// Необязательные заголовки OpenRouter: название приложения в статистике.
+			req.Header.Set("X-Title", "agent_nirs")
+		}
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("запрос к LLM: %w", err)
+		}
+		raw, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusOK {
+			return raw, nil
+		}
+
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		if !retryable || attempt >= c.Retries {
+			return nil, fmt.Errorf("LLM вернула %d: %s%s", resp.StatusCode, shortBody(raw), hint(resp.StatusCode, raw))
+		}
+		wait := retryAfter(resp.Header.Get("Retry-After"), attempt)
+		if c.Log != nil {
+			fmt.Fprintf(c.Log, "[LLM] провайдер ответил %d, повтор через %s (попытка %d из %d)\n",
+				resp.StatusCode, wait, attempt+1, c.Retries)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+// retryAfter — пауза перед повтором: из Retry-After (секунды, не больше
+// минуты) или экспоненциальная 2, 4, 8... секунд.
+func retryAfter(header string, attempt int) time.Duration {
+	if seconds, err := strconv.Atoi(strings.TrimSpace(header)); err == nil && seconds > 0 {
+		return min(time.Duration(seconds)*time.Second, time.Minute)
+	}
+	return time.Duration(2<<attempt) * time.Second
+}
+
+// hint — подсказка к частым ошибкам провайдеров.
+func hint(status int, raw []byte) string {
+	text := strings.ToLower(string(raw))
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "\nПодсказка: проверьте LLM_API_KEY и LLM_BASE_URL."
+	case status == http.StatusNotFound && strings.Contains(text, "tool"):
+		return "\nПодсказка: эта модель не поддерживает вызов инструментов, выберите другую (LLM_MODEL)."
+	case status == http.StatusNotFound:
+		return "\nПодсказка: проверьте название модели в LLM_MODEL."
+	case status == http.StatusTooManyRequests:
+		return "\nПодсказка: исчерпан лимит запросов. У бесплатных моделей OpenRouter — 20 в минуту и 50 в день."
+	case status == http.StatusPaymentRequired:
+		return "\nПодсказка: модель платная или закончились кредиты. Для бесплатной выберите модель с суффиксом :free."
+	}
+	return ""
+}
+
+func shortBody(raw []byte) string {
+	text := strings.TrimSpace(string(raw))
+	if runes := []rune(text); len(runes) > 500 {
+		return string(runes[:500]) + "…"
+	}
+	return text
 }
 
 func envOr(key, fallback string) string {
