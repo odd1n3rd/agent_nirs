@@ -36,6 +36,7 @@ func main() {
 		LLM:          llm.NewFromEnv(),
 		SystemPrompt: prompt.Build(false, false),
 		Memory:       mem,
+		ReadOnly:     cli.ReadOnly(),
 		// Toolboxes: нет. Skills: нет.
 	})
 	if err != nil {

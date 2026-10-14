@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/wannacry39/agent_nirs/internal/tools"
 )
 
 // ServerTool — инструмент MCP-сервера: описание и реализация.
@@ -124,6 +126,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handle(ctx context.Context, w http.ResponseWriter, req Request) (any, *RPCError) {
 	switch req.Method {
 	case "initialize":
+		var params initializeParams
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.ProtocolVersion == "" || params.Capabilities == nil || params.ClientInfo.Name == "" || params.ClientInfo.Version == "" {
+			return nil, &RPCError{codeInvalidParams, "initialize: нужны protocolVersion, capabilities и clientInfo"}
+		}
 		sessionID := s.newSession()
 		w.Header().Set(headerSessionID, sessionID)
 		log.Printf("[MCP-сервер] новая сессия %s", sessionID)
@@ -156,6 +162,9 @@ func (s *Server) handle(ctx context.Context, w http.ResponseWriter, req Request)
 		tool, ok := s.findTool(params.Name)
 		if !ok {
 			return nil, &RPCError{codeInvalidParams, "неизвестный инструмент: " + params.Name}
+		}
+		if err := tools.ValidateArguments(tool.Info.InputSchema, params.Arguments); err != nil {
+			return nil, &RPCError{codeInvalidParams, "некорректные параметры: " + err.Error()}
 		}
 		log.Printf("[MCP-сервер] tools/call: выполняю %s %v", params.Name, params.Arguments)
 		text, err := tool.Handler(ctx, params.Arguments)

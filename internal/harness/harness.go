@@ -258,6 +258,9 @@ func (h *Harness) Run(ctx context.Context, request string) (string, error) {
 			return h.stop(reason), nil
 		}
 		if err := h.manageContext(ctx, b); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				return h.stop(fmt.Sprintf("исчерпан лимит времени (%s)", b.limits.MaxDuration)), nil
+			}
 			return "", err
 		}
 		// Сжатие тоже тратит токены: проверяем лимиты ещё раз.
@@ -292,11 +295,16 @@ func (h *Harness) Run(ctx context.Context, request string) (string, error) {
 		// задача решена.
 		if len(resp.Message.ToolCalls) == 0 {
 			b.steps++
+			if resp.FinishReason == "length" {
+				answer := "Остановлено: ответ модели оборвался на лимите длины ответа."
+				if strings.TrimSpace(resp.Message.Content) != "" {
+					answer += "\nПолученная часть ответа:\n" + resp.Message.Content
+				}
+				h.logf("[LLM] шаг %d: ответ оборвался, задача не считается завершённой", b.steps)
+				return answer, nil
+			}
 			h.logf("[LLM] шаг %d: ответ текстом, цикл завершён (токенов за запрос: %d)", b.steps, b.tokens)
 			if strings.TrimSpace(resp.Message.Content) == "" {
-				if resp.FinishReason == "length" {
-					return "Остановлено: ответ модели оборвался на лимите длины ответа.", nil
-				}
 				return "Модель вернула пустой ответ.", nil
 			}
 			return resp.Message.Content, nil
@@ -308,11 +316,17 @@ func (h *Harness) Run(ctx context.Context, request string) (string, error) {
 			h.skipCalls(resp.Message.ToolCalls, "исчерпан лимит токенов")
 			return h.stop(fmt.Sprintf("исчерпан лимит токенов (%d)", b.limits.MaxTokens)), nil
 		}
+		// Модель может проигнорировать tool_choice: none. Не повторяем такой
+		// ответ бесконечно и не выполняем инструменты вместо последнего шага.
+		if b.steps >= b.limits.MaxSteps-1 {
+			h.skipCalls(resp.Message.ToolCalls, "на последнем шаге требовался финальный ответ")
+			return h.stop(fmt.Sprintf("исчерпан лимит шагов (%d): модель не дала финальный ответ", b.limits.MaxSteps)), nil
+		}
 		for i, call := range resp.Message.ToolCalls {
 			// Последний доступный шаг оставляем на финальный ответ.
 			if b.steps >= b.limits.MaxSteps-1 {
 				h.skipCalls(resp.Message.ToolCalls[i:], "исчерпан лимит шагов")
-				return h.stop(fmt.Sprintf("исчерпан лимит шагов (%d)", b.limits.MaxSteps)), nil
+				break // следующий вызов LLM использует оставшийся шаг для ответа
 			}
 			if b.remaining() <= 0 {
 				h.skipCalls(resp.Message.ToolCalls[i:], "исчерпан лимит времени")
@@ -361,10 +375,8 @@ func (h *Harness) execute(ctx context.Context, call llm.ToolCall, b *budget) too
 			return tools.Result{Content: "параметры не являются корректным JSON: " + err.Error(), IsError: true}
 		}
 	}
-	for _, required := range tool.Required() {
-		if _, ok := args[required]; !ok {
-			return tools.Result{Content: fmt.Sprintf("не передан обязательный параметр %q", required), IsError: true}
-		}
+	if err := tools.ValidateArguments(tool.InputSchema, args); err != nil {
+		return tools.Result{Content: "некорректные параметры: " + err.Error(), IsError: true}
 	}
 
 	// Встроенный инструмент харнесса: записать выбранный skill в контекст.
@@ -432,7 +444,9 @@ func (h *Harness) manageContext(ctx context.Context, b *budget) error {
 			fmt.Fprintf(&transcript, "%s: %s\n", message.Role, shorten(message.Content, 300))
 		}
 	}
-	resp, err := h.cfg.LLM.Complete(ctx, []llm.Message{
+	callCtx, cancel := context.WithTimeout(ctx, b.remaining())
+	defer cancel()
+	resp, err := h.cfg.LLM.Complete(callCtx, []llm.Message{
 		{Role: "system", Content: "Сожми переписку в краткое содержание из 2–4 предложений. Сохрани факты, важные для продолжения диалога."},
 		{Role: "user", Content: transcript.String()},
 	}, nil)
@@ -440,6 +454,12 @@ func (h *Harness) manageContext(ctx context.Context, b *budget) error {
 		return fmt.Errorf("сжатие контекста: %w", err)
 	}
 	b.tokens += resp.TotalTokens
+	if strings.TrimSpace(resp.Message.Content) == "" || len(resp.Message.ToolCalls) != 0 {
+		return errors.New("сжатие контекста: модель не вернула текст сводки; история сохранена")
+	}
+	if resp.FinishReason == "length" {
+		return errors.New("сжатие контекста: сводка оборвалась; история сохранена")
+	}
 	h.context.Summary = resp.Message.Content
 	h.context.Drop(drop)
 	h.logf("[харнесс] контекст сжат: %d старых сообщений заменены кратким содержанием", drop)

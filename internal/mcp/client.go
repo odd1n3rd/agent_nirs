@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,13 +23,22 @@ import (
 // так же, как с локальными. Разница только в том, где выполняется вызов:
 // локальный инструмент выполняет харнесс, MCP-инструмент — MCP-сервер.
 type Client struct {
-	url       string
-	transport Transport
+	url         string
+	transport   Transport
+	operationMu sync.Mutex // вызов не должен попасть в середину переподключения
 
 	mu     sync.Mutex
 	nextID int
 	tools  []tools.Tool
+	// Каталог фиксируется при первом подключении: харнесс проверяет права
+	// по этим описаниям. Изменившийся каталог требует нового клиента и харнесса.
+	catalogLoaded  bool
+	catalogChanged bool
 }
+
+// ErrToolsChanged запрещает вызовы с описаниями, по которым харнесс уже не
+// может проверить актуальные права и параметры.
+var ErrToolsChanged = errors.New("каталог MCP-инструментов изменился; перезапустите агент, чтобы заново проверить инструменты и права")
 
 // NewClient создаёт клиент для MCP-сервера по адресу url (транспорт HTTP).
 func NewClient(url string) *Client {
@@ -36,6 +47,8 @@ func NewClient(url string) *Client {
 
 // Connect — подключение к серверу: initialize, затем список инструментов.
 func (c *Client) Connect(ctx context.Context) error {
+	c.operationMu.Lock()
+	defer c.operationMu.Unlock()
 	if err := c.initialize(ctx); err != nil {
 		return err
 	}
@@ -44,13 +57,23 @@ func (c *Client) Connect(ctx context.Context) error {
 
 // initialize — знакомство с сервером, после него сервер выдаёт сессию.
 func (c *Client) initialize(ctx context.Context) error {
-	_, err := c.send(ctx, "initialize", initializeParams{
+	raw, err := c.send(ctx, "initialize", initializeParams{
 		ProtocolVersion: ProtocolVersion,
 		Capabilities:    map[string]any{},
 		ClientInfo:      implementation{"agent_nirs", "1.0"},
 	})
 	if err != nil {
 		return fmt.Errorf("initialize: %w", err)
+	}
+	var result initializeResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("initialize: разбор ответа: %w", err)
+	}
+	if result.ProtocolVersion != ProtocolVersion {
+		return fmt.Errorf("initialize: версия MCP %q не поддерживается (ожидалась %s)", result.ProtocolVersion, ProtocolVersion)
+	}
+	if _, ok := result.Capabilities["tools"].(map[string]any); !ok {
+		return errors.New("initialize: сервер не объявил возможность tools")
 	}
 	notification := Request{JSONRPC: "2.0", Method: "notifications/initialized"}
 	if _, err := c.transport.Send(ctx, notification); err != nil {
@@ -91,9 +114,16 @@ func (c *Client) listTools(ctx context.Context) error {
 		seen[page.NextCursor] = true
 		cursor = page.NextCursor
 	}
+	// Порядок в tools/list не меняет смысл каталога.
+	sort.Slice(converted, func(i, j int) bool { return converted[i].Name < converted[j].Name })
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.catalogChanged || (c.catalogLoaded && !reflect.DeepEqual(c.tools, converted)) {
+		c.catalogChanged = true
+		return ErrToolsChanged
+	}
 	c.tools = converted
-	c.mu.Unlock()
+	c.catalogLoaded = true
 	return nil
 }
 
@@ -109,6 +139,14 @@ func (c *Client) Tools() []tools.Tool {
 
 // Call отправляет серверу tools/call. Выполняет инструмент сервер.
 func (c *Client) Call(ctx context.Context, name string, args map[string]any) tools.Result {
+	c.operationMu.Lock()
+	defer c.operationMu.Unlock()
+	c.mu.Lock()
+	changed := c.catalogChanged
+	c.mu.Unlock()
+	if changed {
+		return tools.Result{Content: ErrToolsChanged.Error(), IsError: true}
+	}
 	raw, err := c.request(ctx, "tools/call", callToolParams{Name: name, Arguments: args})
 	if err != nil {
 		return tools.Result{Content: "ошибка MCP: " + err.Error(), IsError: true}
@@ -127,11 +165,16 @@ func (c *Client) Call(ctx context.Context, name string, args map[string]any) too
 }
 
 // Close закрывает сессию на сервере.
-func (c *Client) Close(ctx context.Context) { c.transport.Close(ctx) }
+func (c *Client) Close(ctx context.Context) {
+	c.operationMu.Lock()
+	defer c.operationMu.Unlock()
+	c.transport.Close(ctx)
+}
 
 // request отправляет запрос. Если сервер забыл сессию, клиент по спецификации
 // подключается заново (initialize), заново получает список инструментов
-// (сервер мог перезапуститься с другим набором) и повторяет запрос один раз.
+// Повтор допустим только при неизменном каталоге: иначе права и схемы,
+// которые проверил харнесс, уже устарели. Последующие вызовы тоже блокируются.
 func (c *Client) request(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	result, err := c.send(ctx, method, params)
 	if !errors.Is(err, ErrSessionExpired) {
@@ -145,23 +188,7 @@ func (c *Client) request(ctx context.Context, method string, params any) (json.R
 			return nil, err
 		}
 	}
-	if method == "tools/call" && !c.hasTool(params) {
-		return nil, fmt.Errorf("после переподключения сервер больше не предоставляет этот инструмент")
-	}
 	return c.send(ctx, method, params)
-}
-
-func (c *Client) hasTool(params any) bool {
-	call, ok := params.(callToolParams)
-	if !ok {
-		return true
-	}
-	for _, tool := range c.Tools() {
-		if tool.Name == call.Name {
-			return true
-		}
-	}
-	return false
 }
 
 // send отправляет запрос JSON-RPC с новым ID и возвращает результат.

@@ -116,6 +116,7 @@ func (t *HTTPTransport) Close(ctx context.Context) {
 		return
 	}
 	req.Header.Set(headerSessionID, session)
+	req.Header.Set(headerProtocolVersion, ProtocolVersion)
 	if resp, err := t.http.Do(req); err == nil {
 		resp.Body.Close()
 	}

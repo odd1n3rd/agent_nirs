@@ -123,7 +123,10 @@ func TestTokenLimitCheckedBeforeExecution(t *testing.T) {
 
 func TestStepLimitCountsEachToolCall(t *testing.T) {
 	box, weatherCalls, _ := testTools()
-	f := &fakeLLM{reply: func(request) llm.Message {
+	f := &fakeLLM{reply: func(r request) llm.Message {
+		if r.ToolChoice == "none" {
+			return llm.Message{Content: "ответ по выполненным вызовам"}
+		}
 		return llm.Message{ToolCalls: []llm.ToolCall{
 			{ID: "a", Type: "function", Function: llm.FunctionCall{Name: "get_weather", Arguments: "{}"}},
 			{ID: "b", Type: "function", Function: llm.FunctionCall{Name: "get_weather", Arguments: "{}"}},
@@ -133,7 +136,7 @@ func TestStepLimitCountsEachToolCall(t *testing.T) {
 	h := newHarness(t, f, Config{Toolboxes: []tools.Toolbox{box}, Limits: Limits{MaxSteps: 3}})
 
 	answer, _ := h.Run(context.Background(), "погода?")
-	if !strings.Contains(answer, "лимит шагов") {
+	if answer != "ответ по выполненным вызовам" || len(f.requests) != 2 || f.requests[1].ToolChoice != "none" {
 		t.Fatalf("ответ %q", answer)
 	}
 	// Три вызова в одном ответе — три шага; последний шаг оставлен на ответ.
