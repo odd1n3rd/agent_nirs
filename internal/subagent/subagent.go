@@ -125,7 +125,7 @@ func (b *Toolbox) Tools() []tools.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"agent": map[string]any{"type": "string", "description": "Тип субагента из списка", "enum": b.names},
-				"task":  map[string]any{"type": "string", "description": "Задача субагенту со всеми нужными данными"},
+				"task":  map[string]any{"type": "string", "description": "Задача субагенту обычным текстом (строка, не JSON) со всеми нужными данными: города, адреса, имена"},
 			},
 			"required": []string{"agent", "task"},
 		},
