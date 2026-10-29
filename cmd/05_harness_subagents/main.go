@@ -19,6 +19,11 @@
 //   - mail: разбор почты, MCP-инструменты почтового сервера и skill
 //     inbox_digest. Подключается, только если запущен MCP-сервер.
 //
+// Главный агент и субагент mail ходят к одному и тому же инструменту
+// search_messages одного MCP-сервера через один MCP-клиент: главный —
+// для быстрой проверки, субагент — для объёмного разбора, чьи шаги
+// в контекст главного не попадают.
+//
 // Запуск:
 //
 //	go run ./cmd/mcp_mail_server        # в отдельном терминале (для субагента mail)
@@ -72,16 +77,25 @@ func run(ctx context.Context) error {
 
 	// Субагент почты работает с MCP-сервером. Если сервер не запущен,
 	// главный агент работает только с субагентом погоды.
+	//
+	// Один и тот же MCP-клиент (mailServer) попадает и к главному агенту
+	// (только search_messages: быстрая проверка), и к субагенту mail (все
+	// инструменты почты: разбор, сводка, удаление). Оба харнесса ходят
+	// к одному инструменту одного MCP-сервера; для сервера это один клиент
+	// и одна сессия. Субагенты выполняются по очереди, поэтому вызовы не
+	// пересекаются.
 	serverURL := os.Getenv("MCP_SERVER_URL")
 	if serverURL == "" {
 		serverURL = "http://127.0.0.1:8000/mcp"
 	}
 	mailServer := mcp.NewClient(serverURL)
+	mainTools := []tools.Toolbox{tools.Subset(local, "get_current_time", "save_note")}
 	if err := mailServer.Connect(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[MCP-клиент] сервер %s недоступен (%v): субагент mail отключён\n", serverURL, err)
 	} else {
 		defer mailServer.Close(ctx)
 		fmt.Fprintf(os.Stderr, "[MCP-клиент] подключён к %s, инструментов: %d\n", serverURL, len(mailServer.Tools()))
+		mainTools = append(mainTools, tools.Subset(mailServer, "search_messages"))
 		defs = append(defs, subagent.Definition{
 			Name:         "mail",
 			Description:  "Разбор входящей почты: сводка, поиск писем от отправителя, удаление письма. Передай адреса и что нужно сделать.",
@@ -101,18 +115,16 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	// У главного агента: время, заметки и субагенты. Погоду и почту он сам
-	// не получает, только через субагентов.
+	// У главного агента: время, заметки, быстрый поиск по почте (тот же
+	// MCP-клиент, что у субагента mail) и субагенты. Погоду он сам не
+	// получает, только через субагента weather.
 	h, err := harness.New(harness.Config{
 		LLM:          model,
 		SystemPrompt: prompt.Build(true, false) + prompt.Delegation(),
-		Toolboxes: []tools.Toolbox{
-			tools.Subset(local, "get_current_time", "save_note"),
-			subagents,
-		},
-		Memory:   mem,
-		ReadOnly: cli.ReadOnly(),
-		Confirm:  cli.Confirm,
+		Toolboxes:    append(mainTools, subagents),
+		Memory:       mem,
+		ReadOnly:     cli.ReadOnly(),
+		Confirm:      cli.Confirm,
 	})
 	if err != nil {
 		return err

@@ -335,3 +335,88 @@ func TestSubsetHidesOtherTools(t *testing.T) {
 		t.Fatal("Subset выполнил инструмент не из своего набора")
 	}
 }
+
+// countingBox — общий источник инструментов (как mcp.Client): считает,
+// сколько раз к нему обратились.
+type countingBox struct{ calls int }
+
+func (b *countingBox) Name() string { return "общий" }
+func (b *countingBox) Tools() []tools.Tool {
+	return []tools.Tool{{Name: "search_messages", Description: "поиск писем",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}}
+}
+func (b *countingBox) Call(context.Context, string, map[string]any) tools.Result {
+	b.calls++
+	return tools.Result{Content: "письмо от boss@company.com"}
+}
+
+// Главный агент и субагент ходят к одному и тому же инструменту одного
+// источника (один mcp.Client в двух харнессах): главный — сам, субагент —
+// в своём цикле. Источник один, вызовов два, в контексте главного агента
+// от субагента только итог.
+func TestSharedToolboxUsedByMainAndSubagent(t *testing.T) {
+	shared := &countingBox{}
+	f := &fakeLLM{reply: func(r request) llm.Message {
+		toolResults := 0
+		for _, m := range r.Messages {
+			if m.Role == "tool" {
+				toolResults++
+			}
+		}
+		if isSub(r) {
+			if toolResults == 0 {
+				return call("s1", "search_messages", `{"query":"boss@company.com"}`)
+			}
+			return llm.Message{Content: "сводка: одно письмо от начальника"}
+		}
+		switch toolResults {
+		case 0:
+			return call("m1", "search_messages", `{"query":"boss@company.com"}`)
+		case 1:
+			return call("m2", "run_subagent", `{"agent":"mail","task":"разбери письма от boss@company.com"}`)
+		}
+		return llm.Message{Content: "есть письмо; " + last(r).Content}
+	}}
+	server := httptest.NewServer(f)
+	t.Cleanup(server.Close)
+	model := &llm.Client{BaseURL: server.URL, HTTP: server.Client()}
+
+	subs, err := New(Config{LLM: model, Log: io.Discard}, Definition{
+		Name: "mail", Description: "разбор почты", SystemPrompt: subPrompt,
+		Toolboxes: []tools.Toolbox{shared},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	main, err := harness.New(harness.Config{
+		LLM: model, SystemPrompt: mainPrompt, Log: io.Discard,
+		Toolboxes: []tools.Toolbox{shared, subs}, // тот же экземпляр, что у субагента
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, err := main.Run(context.Background(), "есть письма от начальника? сделай сводку")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shared.calls != 2 {
+		t.Fatalf("общий инструмент вызван %d раз, ожидалось 2 (главный агент и субагент)", shared.calls)
+	}
+	if !strings.Contains(answer, "сводка: одно письмо") {
+		t.Fatalf("итог субагента не дошёл до главного агента: %q", answer)
+	}
+	// Вызов search_messages субагентом в контексте главного агента не виден.
+	mainRequests := f.byAgent(mainPrompt)
+	final := mainRequests[len(mainRequests)-1]
+	searchCalls := 0
+	for _, m := range final.Messages {
+		for _, c := range m.ToolCalls {
+			if c.Function.Name == "search_messages" {
+				searchCalls++
+			}
+		}
+	}
+	if searchCalls != 1 {
+		t.Fatalf("в контексте главного агента %d вызовов search_messages, ожидался 1 (его собственный):\n%s", searchCalls, dump(final))
+	}
+}
